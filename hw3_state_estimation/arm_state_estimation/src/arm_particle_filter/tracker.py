@@ -1,0 +1,246 @@
+import random
+from operator import pos
+
+import cv2
+import imutils
+import matplotlib
+import matplotlib.pyplot as plt
+import numpy as np
+import rospkg
+import rospy
+from cv_bridge import CvBridge
+from geometry_msgs.msg import Point, Pose, PoseStamped
+from sensor_msgs.msg import Image
+from std_msgs.msg import Header
+from visualization_msgs.msg import Marker, MarkerArray
+
+from arm_particle_filter.particle_filter import ParticleFilter
+
+matplotlib.use('Agg')
+
+random.seed(42)
+np.random.seed(42)
+plt.ylim(top=100)
+
+cm = np.array([[500.0, 0.0, 320, 0.0], [
+              0.0, 500, 240, 0.0], [0.0, 0.0, 1.0, 0.0]])
+CM_INV = np.linalg.pinv(cm)
+
+
+def convert_pixel_to_pos(pixel_x, pixel_y):
+    p = np.array([pixel_x, pixel_y, 1])
+    real = np.dot(CM_INV, p)
+    real[0] = 1.95 * real[0]
+    real[1] = 1.95 * (real[1])
+    real[0] *= -1
+    return real[0], real[1]
+
+
+class CubeTracker:
+    def __init__(self):
+        # SOLUTION: Parameters to tune
+        ################################################################
+        # Number of particles to be initialized for the particle filter
+        num_particles = 500
+
+        # Constant velocity to be supplied to ParticleFilter.predict
+        self.constant_vel = np.array([0, 0])
+
+        # Sample motion model noise with this std=std_constant_vel
+        std_constant_vel = 5
+
+        # Initial mean and covariance of the sampled particles
+        initial_mean = np.array([300, 10]).reshape((-1, 1))
+        initial_cov = np.diag([5, 5])
+        ################################################################
+        # num_particles = 1000 # 500
+
+        # # Constant velocity to be supplied to ParticleFilter.predict
+        # self.constant_vel = np.array([0, 0]) # 0, 0
+
+        # # Sample motion model noise with this std=std_constant_vel
+        # std_constant_vel = 100 # sol 5, 5 # initial 100
+
+        # # Initial mean and covariance of the sampled particles
+        # initial_mean = np.array([320, 320]).reshape((-1, 1)) # 300, 10
+        # initial_cov = np.diag([10e7, 10e7]) # 5, 5
+
+        self.pf = ParticleFilter(
+            initial_mean,
+            initial_cov,
+            num_particles,
+            std_constant_vel
+        )
+
+        self.x_prev = int(initial_mean[0])
+        self.y_prev = int(initial_mean[1])
+        self.cube_gt = None
+        self.w = 30
+        self.h = 30
+
+        self.gt_cube_pub = rospy.Publisher(
+            '/gt_pose', PoseStamped, queue_size=1)
+        self.estimated_cube_pub = rospy.Publisher(
+            '/estimated_point', PoseStamped, queue_size=1)
+        self.estimated_3dcube_pub = rospy.Publisher(
+            '/estimaded_cube', Marker, queue_size=10)
+        self.image_sub = rospy.Subscriber(
+            '/camera1/image_raw', Image, self.detect_cb)  # check name by rostopic list
+        self.plot = bool(rospy.get_param("~plot", False))
+        self.detected = False
+        self.running = True
+        rospack = rospkg.RosPack()
+        self.plot_path = rospack.get_path('arm_particle_filter')
+
+    def pause_pf(self):
+        self.running = False
+        rospy.loginfo("Pausing the particle filter.")
+
+    def resume_pf(self):
+        self.running = True
+        rospy.loginfo("Resuming the particle filter.")
+
+    def kill_pf(self):
+        rospy.signal_shutdown("Tracking complete!")
+
+    def get_detection(self, image, header):
+        """Detect and return cube position coordinates.
+
+        Args:
+            image: cv2 image frame
+            header: ROS header object
+
+        Returns:
+            (float, float) comprising of the detected cube position
+        """
+        lower1 = np.array([0, 100, 20])
+        upper1 = np.array([10, 255, 255])
+
+        lower2 = np.array([160, 100, 20])
+        upper2 = np.array([179, 255, 255])
+
+        lower_mask = cv2.inRange(image, lower1, upper1)
+        upper_mask = cv2.inRange(image, lower2, upper2)
+
+        thresh = lower_mask + upper_mask
+
+        cnts = cv2.findContours(
+            thresh.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cnts = imutils.grab_contours(cnts)
+
+        for c in cnts:
+            # compute the center of the contour
+            detected = True
+            (x_true, y_true, w, h) = cv2.boundingRect(c)
+            gt_pose = PoseStamped()
+            gt_pose.header = header
+            gt_pose.pose.position.x, gt_pose.pose.position.y = x_true, y_true
+            self.gt_cube_pub.publish(gt_pose)
+            self.detected = True
+            return x_true, y_true, w, h
+        else:
+            return [None]*4
+
+    def add_noise(self, x_true, y_true, w, h, current_frame):
+        """Add simulated noise to ground truth position for the cube.
+
+        Args:
+            x_true (int): true x-coordinate of cube corner
+            y_true (int): true y-coordinate of cube corner
+            w (int): width of detected cube
+            h (int): height of detected cube
+            current_image: cv2 image frame
+
+        Returns:
+            (float, float) comprising of the noisy detected cube position
+        """
+        if np.random.rand() > 0.7:
+            x = x_true + int(np.random.normal(0, 50, 1))
+            y = y_true + int(np.random.normal(0, 50, 1))
+        else:
+            x = x_true
+            y = y_true
+        cv2.rectangle(current_frame, (x, y), (x + w, y + h), (255, 0, 0), 2)
+        x = x + w/2
+        y = y + h/2
+        return x, y
+
+    def detect_cb(self, data):
+        """Detects, tracks and publishes the estimated position
+        a moving cube.
+
+        Args:
+            data (sensor_msgs.msg.Image): top down RGB image
+        """
+        self.detected = False
+        stamp = rospy.Time.now()
+        header = Header()
+        header.stamp = stamp
+        header.frame_id = "world"
+        br = CvBridge()
+        current_frame = br.imgmsg_to_cv2(data)
+        image = image = cv2.cvtColor(current_frame, cv2.COLOR_BGR2HSV)
+        result = current_frame.copy()
+
+        if self.running:
+            # Obtain true detected pose of cube
+            x_true, y_true, w, h = self.get_detection(image, header)
+
+            if self.detected:
+                if np.linalg.norm([x_true - 315, y_true - 355]) < 35:
+                    rospy.signal_shutdown("Task complete!")
+                cv2.rectangle(current_frame, (x_true, y_true),
+                              (x_true + w, y_true + h), (0, 0, 255), 4)
+
+                # Add simulated noise to detected pose
+                x, y = self.add_noise(x_true, y_true, w, h, current_frame)
+                self.x_prev, self.y_prev = x, y
+
+            if not self.detected:
+                x, y = self.x_prev, self.y_prev
+            w, h = self.w, self.h
+
+            # Predict target pose
+            self.pf.predict(self.constant_vel)
+
+            # Update particle and corresponding weights
+            mean, cov = self.pf.update(np.array([x, y]))
+            self.pf.draw_particles(current_frame)
+
+            # Resample all particles
+            self.pf.resampler.resample()
+
+            x_estimated, y_estimated = mean.ravel().astype(int)
+
+            # Draw pf estimated cube position on image
+            x_draw = x_estimated - int(w/2)
+            y_draw = y_estimated - int(h/2)
+            cv2.rectangle(current_frame, (x_draw, y_draw),
+                          (x_draw + w, y_draw + h), (0, 255, 0), 4)
+
+            # Publish estimated cube position for the arm to track
+            pt = PoseStamped()
+            pt.header = header
+            pt.pose.position.x, pt.pose.position.y = x_estimated, y_estimated
+            self.estimated_cube_pub.publish(pt)
+
+            x_estimated, y_estimated = convert_pixel_to_pos(
+                x_estimated, y_estimated)
+            marker = Marker()
+            marker.header.frame_id = "world"
+            marker.type = Marker.CUBE
+            marker.pose = Pose()
+            marker.pose.position.x = x_estimated
+            marker.pose.position.y = y_estimated
+            marker.pose.orientation.w = 1.
+            marker.color.r = 0.0
+            marker.color.g = 255.0
+            marker.color.b = 0.0
+            marker.color.a = 0.5
+            marker.scale.x = 0.12
+            marker.scale.y = 0.12
+            marker.scale.z = 0.12
+            self.estimated_3dcube_pub.publish(marker)
+
+        cv2.imshow("camera", current_frame)
+        cv2.waitKey(1)

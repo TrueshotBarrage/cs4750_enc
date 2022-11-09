@@ -1,0 +1,7 @@
+<launch>
+  <node pkg="introduction" type="palindrome" name="palindrome">
+    <param name="test_number" value="1001.0" />
+    <param name="output_topic" value="/introduction/palindrome_output" />
+  </node>
+  <test test-name="test_palindrome_small" pkg="introduction" type="test_palindrome_small.py"/>
+</launch>
